@@ -1,0 +1,78 @@
+
+model_name: AilmV1
+
+rng_seed: 42
+# If you delete this the trainer will calculate the chinchilla optimal number of tokens.
+token_budget: 4.0e+6
+# Easily override these for testing.
+# step_count: 2000
+# gradient_accumulation_steps: 12
+
+# Set a memory limit of 30gib. MacOS will hang if the compute graph balloons above the size of RAM.
+memory_limit: 32212254720
+
+# The number of batches to run validation over.
+validation_batches: 50
+
+model_config:
+# Empty for now, but you can override AilmV1Config here.
+
+# To determine a solid learning rate schedule I did a survey of various model papers and consulted the
+# Huggingface Smol Training Playbook
+# Playbook: https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook#scaling-laws-for-hyperparameters
+# Survey: https://docs.google.com/spreadsheets/d/1mTQkUpaVkdVNfDkuHVeTPam0ERx-XIXm_8Dy2JUf1qk/edit?usp=sharing
+learning_rate_schedule:
+  # Karpathy follows the GPT2 paper to do a warmup followed by cosine decay.
+  kind: cosine
+  # Here we follow the SmolLM learning rates I found in my survey.
+  # Their model size is most similar to my own.
+  learning_rate_max: 0.003
+  learning_rate_min: 0.0003
+  # This figure was chosen for wildly different training sizes in my survey. I may want to revisit it.
+  warmup_steps: 2000
+
+optimizer:
+  name: adamw
+  # MLX defaults beta2 to 0.999 but all of the models in the survey which report beta2 use 0.95
+  adamw_betas: [0.9, 0.95]
+  # This is the default of MLX and used by SmolLM.
+  adamw_epsilon: 1.0e-08
+  # Smaller models tend to use less weight decay.
+  weight_decay: 0.01
+  # Widely used in the survey and recommened by Karpathy and Smollm
+  gradient_norm_clipping: 1.0
+
+# We train off of a subset of fineweb edu 20B.
+training_data_loader:
+  kind: fineweb
+  directory: datasets/fineweb_edu_sample
+
+# I took the last, smaller parquet file from fineweb edu 20B and called it a validation set.
+validation_data_loader:
+  kind: fineweb
+  directory: datasets/fineweb_edu_sample/validate
+
+batching:
+  # Modern LLMs use sequence lengths of around 2048-4096.
+  # However, to train on my laptop it's important to keep the memory requirements small, and increasing this will cause quadratic growth of the attention matrix.
+  sequence_length: 1024
+  # 0.5e6 rounded up to be a multiple of sequences_per_micro_batch * sequence_length
+  tokens_per_batch: 503808
+  # Since I'm compute bound, on my M1 Max both 4 and 8 get similar performance, but 4 uses less RAM.
+  # 4 also leads to less variance in tokens per second.
+  sequences_per_micro_batch: 4
+
+
+# Intervals at which to perform various expensive tasks.
+# These are expressed in terms of full batch steps, not microbatch steps.
+intervals:
+  save_interval: 10
+  validation_interval: 10
+  log_interval: 1
+
+
+tokenizing:
+  tokenizer_name: gpt2
+  tokenizer_queue_length: 8
+  encoder_stall_seconds: 300
+  trainer_stall_seconds: 300
