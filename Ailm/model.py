@@ -44,6 +44,7 @@ class AilmV1Config:
     - mlp_size: The inner dimension of the Multi-Layer Perceptron.
     - use_kv_cache: Whether to use Key Value Caching. We recommend keeping this off for training, and enabling it for inference.
     - use_attention_sinks: Whether to use attention sinks. Attention sinks allow the model to not pay attention to certain tokens. See [Attention sinks](https://arxiv.org/pdf/2309.17453).
+    - no_rms_norm_weight: Disable weights on RMS norms. Empirically they are all set to 1. This saves a few parameters.
     '''
 
     # This config is more like baguettotron. It's leaner and deeper.
@@ -69,6 +70,7 @@ class AilmV1Config:
     key_value_head_count: int = 4
     dtype: mlx.core.Dtype = mlx.core.bfloat16
     use_attention_sinks: bool = True
+    no_rms_norm_weight: bool = True
 
     # This config is more like gpt2 medium.
     # At our current rate of 2.4k tokens per second with this config it will take us 28 days on my M1 max
@@ -224,7 +226,7 @@ class CausalSelfAttention(nn.Module):
 
         # Performance optimization: If we're using KV caching, we don't actually need to send any of the cached context on from here.
         if self.use_kv_cache:
-            y = y[:, :, -1, :].transpose(0, 2, 1, 3).reshape([B, 1, C])
+            y = y[:, :, -1:, :].transpose(0, 2, 1, 3).reshape([B, 1, C])
         else:
             # Reshape the tensor so it's laid out like the original residual stream.
             y = y.transpose(0, 2, 1, 3).reshape([B, T, C])
@@ -245,6 +247,9 @@ class CausalSelfAttention(nn.Module):
         self.use_kv_cache = enable_key_value_cache
 
 
+def rms_norm(hidden: Tensor) -> Tensor:
+    return mlx.core.fast.rms_norm(hidden, None, eps=1e-8)
+
 class Layer(nn.Module):
     '''
     A single layer in the model.
@@ -256,9 +261,15 @@ class Layer(nn.Module):
         super().__init__()
 
         self.attn = CausalSelfAttention(config, rope)
-        self.ln_1 = nn.RMSNorm(config.hidden_size)
+        #self.ln_1 = nn.RMSNorm(config.hidden_size)
+        self.ln_1 = rms_norm
         self.mlp = Mlp(config)
-        self.ln_2 = nn.RMSNorm(config.hidden_size)
+        #self.ln_2 = nn.RMSNorm(config.hidden_size)
+        self.ln_2 = rms_norm
+        #if config.no_rms_norm_weight:
+        #    # The inferred type is incorrect, it should be an Optional[mlx.array]
+        #    self.ln_1.weight = None # pyright: ignore reportAttributeAccessIssue
+        #    self.ln_2.weight = None # pyright: ignore reportAttributeAccessIssue
 
     def __call__(self, x: Tensor) -> Tensor:
         '''
@@ -286,15 +297,20 @@ class Transformer(nn.Module):
 
         # All of the layers share one fixed copy of the Rotary Positional Embeddings.
         rope = nn.RoPE(config.hidden_size//config.head_count)
+        rope.freeze()
 
         # The sequential layers in the model.
         self.h = nn.Sequential(*[Layer(config, rope) for _ in range(config.layer_count)])
 
         # The final normalization for the transformer.
-        self.ln_f = nn.RMSNorm(config.hidden_size)
+        self.ln_f = rms_norm
+        #self.ln_f = nn.RMSNorm(config.hidden_size)
+        #if config.no_rms_norm_weight:
+        #    # The inferred type is incorrect, it should be an Optional[mlx.array]
+        #    self.ln_f.weight = None # pyright: ignore reportAttributeAccessIssue
 
         self.wte.set_dtype(config.dtype)
-        self.ln_f.set_dtype(config.dtype)
+        #self.ln_f.set_dtype(config.dtype)
         self.h.set_dtype(config.dtype)
 
 class AilmV1(nn.Module):
