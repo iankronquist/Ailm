@@ -1,0 +1,6 @@
+
+datasets==4.1.1
+mlx==0.29.2
+tiktoken==0.11.0
+wandb==0.22.2
+
