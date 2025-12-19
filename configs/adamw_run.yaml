@@ -1,9 +1,11 @@
 
 model_name: AilmV1
 
+use_wandb: True
+
 rng_seed: 42
 # If you delete this the trainer will calculate the chinchilla optimal number of tokens.
-token_budget: 4.0e+6
+# token_budget: 4.0e+6
 # Easily override these for testing.
 # step_count: 2000
 # gradient_accumulation_steps: 12
@@ -76,3 +78,10 @@ tokenizing:
   tokenizer_queue_length: 8
   encoder_stall_seconds: 300
   trainer_stall_seconds: 300
+
+inference:
+    prompt: "To be or not to be,"
+    max_tokens_to_generate: 10
+    max_batches: 4
+    k: 4
+    temperature: 0.5
