@@ -12,7 +12,7 @@ import typing
 import mlx.core
 from mlx.core import array as Tensor
 
-from datasets import load_dataset
+import datasets
 
 from abc import ABC, abstractmethod
 
@@ -41,11 +41,11 @@ class FineWebDataLoader(AbstractDataLoader):
         else:
             parquets = [os.path.join(file_path, fname) for fname in os.listdir(file_path) if fname.endswith('parquet')]
 
-        dataset = load_dataset('parquet', data_files=parquets)
+        dataset = datasets.load_dataset('parquet', data_files=parquets)
+        dataset = typing.cast(datasets.DatasetDict, dataset)
         self.dataset: typing.List = dataset[subset][feature]
         self.tokens = None
         self.tokens_pos = 0
-
 
         if self.shuffle:
             self.shuffled_indices = (list(range(len(self.dataset))))
@@ -74,9 +74,9 @@ class FineWebDataLoader(AbstractDataLoader):
 
     #def __del__(self):
     #    self.progress_bar.close()
-    def batches_per_epoch(self):
-        total_tokens = 10e9
-        return total_tokens / (self.B * self.T)
+    #def batches_per_epoch(self):
+    #    total_tokens = 10e9
+    #    return total_tokens / (self.B * self.T)
 
     def column(self) -> int:
         return self.current_column
@@ -111,7 +111,7 @@ class FineWebDataLoader(AbstractDataLoader):
         if self.start_column is not None:
             self.current_column = self.start_column
         else:
-            self.start_column = 0
+            self.current_column = 0
 
     def view(self, tensor, B, T):
         return tensor.reshape((B, T))
