@@ -4,26 +4,31 @@
 An LLM training script.
 '''
 import os
+import signal
+import sys
 import math
-from pprint import pprint
-import random
 import time
+import json
 import yaml
 import queue
+import random
 import typing
 import threading
 import dataclasses
+from pprint import pprint
 
 import mlx.nn
 import mlx.nn.losses
 import mlx.optimizers
+import mlx.core as mx
 from mlx.core import array as Tensor
 from mlx.utils import tree_reduce, tree_map, tree_flatten
-import mlx.core as mx
 
-import tiktoken
+# import Foundation
 import wandb
+import tiktoken
 
+from infer import InferenceManager, infer
 from model import AilmV1Config, AilmV1
 from fineweb_data_loader import FineWebDataLoader, AbstractDataLoader
 
@@ -31,6 +36,14 @@ from fineweb_data_loader import FineWebDataLoader, AbstractDataLoader
 
 TERMINAL_COLOR_RED='\033[0;31m'
 TERMINAL_COLOR_RESET='\033[0m'
+
+def handle_pdb(sig, frame):
+    import pdb
+    pdb.Pdb().set_trace(frame)    
+
+# def name_current_thread(name: str):
+#     '''Give the current NSThread a nice name which shows up in the XCode Instruments profiler'''
+#     Foundation.NSThread.currentThread().setName_(name) # pyright: ignore reportAttributeAccessIssue
 
 def count_params(model: mlx.nn.Module) -> int:
     '''Count the number of parameters in an MLX module. Does not double count modules which share weights.'''
@@ -68,7 +81,7 @@ def format_time(seconds: float) -> str:
     seconds = int(seconds)
 
     seconds_per_minute = 60
-    seconds_per_hour = 60 * 60
+    seconds_per_hour = 60 * seconds_per_minute
     seconds_per_day = 24 * seconds_per_hour
 
     if seconds < seconds_per_minute:
@@ -97,14 +110,14 @@ class LearningRateScheduleConfig:
     - kind: May be one of fixed, trapezoid, or cosine. Other learning rate schedules such as trapezoidal and warmup->hold->cosine may be supported in the future.
     - learning_rate_max: The highest value of the learning rate.
     - learning_rate_min: Required for cosine. The lowest value of the learning rate. Often 10% of the highest value.
-    - warmup_steps: Required for cosine. The number of steps of the linear warmup ramp.
-    - warmup_steps: Required for cosine. The number of steps of the linear rampdown.
+    - warmup_percent: Required for cosine. The percent of steps of the linear warmup ramp.
+    - rampdown_percent: Required for cosine. The percent of steps of the linear rampdown.
     '''
     kind: str
     learning_rate_max: float
     learning_rate_min: typing.Optional[float]
-    warmup_steps: typing.Optional[int]
-    rampdown_steps: typing.Optional[int] = None
+    warmup_percent: typing.Optional[float]
+    rampdown_percent: typing.Optional[float] = None
 
 @dataclasses.dataclass
 class OptimizerConfig:
@@ -136,7 +149,7 @@ class DataLoaderConfig:
     '''
     kind: str
     directory: str
-    start_column: int = 0
+    shuffle: bool
 
 @dataclasses.dataclass
 class BatchConfig:
@@ -181,8 +194,37 @@ class IntervalsConfig:
     save_interval: int
     validation_interval: int
     log_interval: int
+    inference_interval: typing.Optional[int]
+
+@dataclasses.dataclass
+class InferenceConfig:
+    '''Periodically run inference to get a subjective impression of how good the text actually is.
+
+    - prompt: The prompt to provide to the model.
+    - max_tokens_to_generate: The number of tokens to generate. Does not count the length of the prompt.
+    - max_batches: The number of batches to generate in parallel from the same prompt.
+    - temperature: The temperature at which to sample.
+    - k: The k cutoff for top-k sampling.
+    '''
+    prompt: str
+    max_tokens_to_generate: int
+    max_batches: int
+    k: int
+    temperature: float
+
+@dataclasses.dataclass
+class ResumeConfig:
+    resume_weights: str
+    resume_optimizer: str
+    resume_step: int
+    resume_column: int
 
 # MARK: Constructors
+
+def percent_to_steps(percent: float, max_steps: int) -> int:
+    assert percent < 100
+    fraction = percent / 100
+    return int(max_steps * fraction)
 
 def create_learning_rate_scheduler(optimizer_config: LearningRateScheduleConfig, max_steps: int):
     '''
@@ -203,10 +245,10 @@ def create_learning_rate_scheduler(optimizer_config: LearningRateScheduleConfig,
 
     if optimizer_config.kind == 'cosine':
         assert optimizer_config.learning_rate_min is not None
-        assert optimizer_config.warmup_steps is not None
+        assert optimizer_config.warmup_percent is not None
         learning_rate_min = mx.array(optimizer_config.learning_rate_min)
 
-        warmup_steps = mx.array(optimizer_config.warmup_steps)
+        warmup_steps = mx.array(percent_to_steps(optimizer_config.warmup_percent, max_steps))
 
         def warmup_cosine_decay_lr_schedule(step: Tensor) -> Tensor:
             step_f = step.astype(mx.float32)
@@ -231,13 +273,12 @@ def create_learning_rate_scheduler(optimizer_config: LearningRateScheduleConfig,
     elif optimizer_config.kind == 'trapezoid':
 
         assert optimizer_config.learning_rate_min is not None
-        assert optimizer_config.warmup_steps is not None
-        assert optimizer_config.rampdown_steps is not None
+        assert optimizer_config.warmup_percent is not None
+        assert optimizer_config.rampdown_percent is not None
 
         learning_rate_min = mx.array(optimizer_config.learning_rate_min)
-        warmup_steps = mx.array(optimizer_config.warmup_steps)
-        rampdown_steps = mx.array(optimizer_config.rampdown_steps, mx.float32)
-        rampdown_begin = max_steps - rampdown_steps
+        warmup_steps = mx.array(percent_to_steps(optimizer_config.warmup_percent, max_steps))
+        rampdown_steps = mx.array(percent_to_steps(optimizer_config.rampdown_percent, max_steps))
 
         rampdown_begin = max_steps - rampdown_steps
         learning_rate_diff = learning_rate_max - learning_rate_min
@@ -274,14 +315,16 @@ def create_learning_rate_scheduler(optimizer_config: LearningRateScheduleConfig,
     else:
         raise NotImplementedError(f'optimizer schedule kind "{optimizer_config.kind}" is not implemented')
 
-def create_data_loader(data_loader_config: DataLoaderConfig, batch_config: BatchConfig, tokenizer: tiktoken.Encoding) -> AbstractDataLoader:
+def create_data_loader(data_loader_config: DataLoaderConfig, batch_config: BatchConfig, tokenizer: tiktoken.Encoding, resume_config: typing.Optional[ResumeConfig]) -> AbstractDataLoader:
     '''Create a data loader from a data loader config.'''
 
+    start_column = resume_config.resume_column if resume_config else 0
+
     if data_loader_config.kind == 'fineweb':
-        return FineWebDataLoader(batch_config.sequences_per_micro_batch, batch_config.sequence_length, data_loader_config.directory, tokenizer, start_column=data_loader_config.start_column)
+        return FineWebDataLoader(batch_config.sequences_per_micro_batch, batch_config.sequence_length, data_loader_config.directory, tokenizer, start_column=start_column, shuffle=data_loader_config.shuffle)
     raise NotImplementedError(f"Unknown data loader kind {data_loader_config.kind}")
 
-def create_model(training_config: dict) -> tuple[mlx.nn.Module, AilmV1Config]:
+def create_model(training_config: dict, resume_config: typing.Optional[ResumeConfig]) -> tuple[AilmV1, AilmV1Config]:
     '''Create the model from the training config'''
     # For now we only support AilmV1, but I may want to change the architecture later.
     assert training_config['model_name'] == 'AilmV1'
@@ -291,8 +334,25 @@ def create_model(training_config: dict) -> tuple[mlx.nn.Module, AilmV1Config]:
 
     # Initialize the model.
     model = AilmV1(model_config)
+    if resume_config:
+        model.load_weights(resume_config.resume_weights)
     return model, model_config
 
+def create_optimizer(optimizer_config: OptimizerConfig, resume_config: typing.Optional[ResumeConfig], learning_rate_schedule: typing.Union[float, typing.Callable[[mx.array], mx.array]]) -> mlx.optimizers.Optimizer:
+    '''Create the optimizer for our training run.'''
+    if optimizer_config.name == 'muon':
+        assert optimizer_config.muon_momentum is not None
+        optimizer = mlx.optimizers.Muon(learning_rate=learning_rate_schedule, momentum=optimizer_config.muon_momentum, weight_decay=optimizer_config.weight_decay)
+    elif optimizer_config.name == 'adamw':
+        assert optimizer_config.adamw_betas is not None
+        assert optimizer_config.adamw_epsilon is not None
+        optimizer = mlx.optimizers.AdamW(learning_rate=learning_rate_schedule, betas=optimizer_config.adamw_betas, weight_decay=optimizer_config.weight_decay, eps=optimizer_config.adamw_epsilon)
+    else:
+        raise NotImplementedError(f"Unimplemented optimizer {optimizer_config.name}")
+    if resume_config:
+        resume_state = mx.load(resume_config.resume_weights)
+        optimizer.state = typing.cast(dict, resume_state)
+    return optimizer
         
 def calculate_optimal_token_budget(parameter_count: int) -> int:
     '''See the Deepmind chinchilla paper: https://arxiv.org/pdf/2203.15556'''
@@ -335,17 +395,19 @@ def validate(model: mlx.nn.Module, val_loader: AbstractDataLoader, val_queue: qu
 
 # MARK: Encoding
 
-def create_encoder_worker(tokenizing_config: TokenizingConfig, data_loader: AbstractDataLoader) -> queue.Queue:
+def create_encoder_worker(tokenizing_config: TokenizingConfig, data_loader: AbstractDataLoader, name: str) -> queue.Queue:
     '''Create and start the encoder worker thread. We perform tokenization encoding on a separate thread so we don't stall the GPU while waiting for tokenization to complete. The main thread will pop completed batches of tokens off of a queue, which will awaken the tokenization thread to perform its work.'''
 
     encoder_queue = queue.Queue(tokenizing_config.tokenizer_queue_length)
-    worker = threading.Thread(target=encoding_worker, args=(tokenizing_config, encoder_queue, data_loader,))
+    worker = threading.Thread(name=name, target=encoding_worker, args=(tokenizing_config, encoder_queue, data_loader, name))
     worker.start()
     return encoder_queue
 
-def encoding_worker(tokenizing_config: TokenizingConfig, encoder_queue: queue.Queue, data_loader: AbstractDataLoader):
+def encoding_worker(tokenizing_config: TokenizingConfig, encoder_queue: queue.Queue, data_loader: AbstractDataLoader, name: str):
     '''Encoder worker thread. In an infinite loop, encode, push to the queue, and wait until there is room on the queue to encode again.'''
-    print('Starting tokenizer worker')
+    print('Starting tokenizer worker', name)
+    # if name:
+    #     name_current_thread(name)
     # FIXME This seems to be necessary to fix a strange import bug in the event of a save shutdown
     import queue
     while True:
@@ -359,7 +421,7 @@ def encoding_worker(tokenizing_config: TokenizingConfig, encoder_queue: queue.Qu
 
 # MARK: Saving
 
-def create_save_worker(model: mlx.nn.Module, optimizer: mlx.optimizers.Optimizer, run_dir_path: str, timeout: typing.Optional[int]) -> tuple[queue.Queue, threading.Lock]:
+def create_save_worker(model: mlx.nn.Module, optimizer: mlx.optimizers.Optimizer, run_dir_path: str, timeout: typing.Optional[int], name: str) -> tuple[queue.Queue, threading.Lock]:
     '''Create and start the save worker thread.
     We perform weight saving on a separate thread so we don't stall the GPU while waiting for disk writes to complete.
     The training thread will send a message to the queue telling the worker to save the weights.
@@ -370,12 +432,14 @@ def create_save_worker(model: mlx.nn.Module, optimizer: mlx.optimizers.Optimizer
 
     save_queue = queue.Queue(1)
     lock = threading.Lock()
-    worker = threading.Thread(target=save_worker, args=(model, optimizer, run_dir_path, save_queue, lock,))
+    worker = threading.Thread(name=name, target=save_worker, args=(model, optimizer, run_dir_path, save_queue, lock, name))
     worker.start()
     return save_queue, lock
 
-def save_worker(model: mlx.nn.Module, optimizer: mlx.optimizers.Optimizer, run_dir_path: str, save_queue: queue.Queue, save_lock: threading.Lock):
-    print('Starting save worker')
+def save_worker(model: mlx.nn.Module, optimizer: mlx.optimizers.Optimizer, run_dir_path: str, save_queue: queue.Queue, save_lock: threading.Lock, name: str):
+    print('Starting tokenizer worker', name)
+    # if name:
+    #     name_current_thread(name)
     model_checkpoint_name = os.path.join(run_dir_path, 'model_checkpoint.npz')
     optimizer_checkpoint_name = os.path.join(run_dir_path, 'opt_checkpoint.safetensors')
     # FIXME This seems to be necessary to fix a strange import bug in the event of a save shutdown
@@ -403,9 +467,8 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     '''
     training_start = time.strftime("%Y%m%d-%H%M")
 
-    # It is in some sense a miracle that LLM training works at all.
-    print('᚛ᚁᚓᚅᚇᚇᚐᚉᚈᚐᚅᚔᚋᚂ᚜')
-    print('Ailm LLM Trainer')
+    # HACK: It seems kind of janky but if I send SIGUSR1 to the training process I should be able to break into it with PDB and edit things on the fly.
+    signal.signal(signal.SIGUSR1, handle_pdb)
 
     # Initialize config objects.
     learning_rate_schedule_config = LearningRateScheduleConfig(**config['learning_rate_schedule'])
@@ -415,6 +478,11 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     validation_loader_config = DataLoaderConfig(**training_config['validation_data_loader'])
     tokenizing_config = TokenizingConfig(**training_config['tokenizing'])
     intervals_config = IntervalsConfig(**training_config['intervals'])
+    inference_config = InferenceConfig(**training_config['inference'])
+    if training_config.get('resume'):
+        resume_config = ResumeConfig(**training_config['resume'])
+    else:
+        resume_config = None
 
     # Basic sanity check that our validation set is different than our training set.
     assert training_loader_config.directory != validation_loader_config.directory
@@ -429,10 +497,9 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     mx.random.seed(rng_seed)
 
     # TODO: Optionally reload module weights if the training config specifies them.
-    model, model_config = create_model(training_config)
+    model, model_config = create_model(training_config, resume_config)
 
     parameter_count = count_params(model)
-
 
     # Calculate the token budget if necessary.
     if training_config.get('token_budget') is None:
@@ -460,51 +527,37 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
 
     validation_batches = training_config['validation_batches']
 
-    pprint(training_config)
-
-    print(f'Training process pid is {os.getpid()}')
-    print('Training started at', training_start)
-    print("The model has", format_count(parameter_count), "parameters")
-    print('tokens to process', format_count(tokens_to_process))
-    print('step count', step_count)
-    print('gradient_accumulation_steps', gradient_accumulation_steps)
-    print('update count', update_count)
-
     # Get the learning rate schedule for our training run. It is either a function which can by compiled by MLX or a scalar.
     learning_rate_schedule = create_learning_rate_scheduler(learning_rate_schedule_config, update_count)
 
     # Create the optimizer for our training run.
-    if optimizer_config.name == 'muon':
-        assert optimizer_config.muon_momentum is not None
-        optimizer = mlx.optimizers.Muon(learning_rate=learning_rate_schedule, momentum=optimizer_config.muon_momentum, weight_decay=optimizer_config.weight_decay)
-    elif optimizer_config.name == 'adamw':
-        assert optimizer_config.adamw_betas is not None
-        assert optimizer_config.adamw_epsilon is not None
-        optimizer = mlx.optimizers.AdamW(learning_rate=learning_rate_schedule, betas=optimizer_config.adamw_betas, weight_decay=optimizer_config.weight_decay, eps=optimizer_config.adamw_epsilon)
-    else:
-        raise NotImplementedError(f"Unimplemented optimizer {optimizer_config.name}")
+    optimizer = create_optimizer(optimizer_config, resume_config, learning_rate_schedule)
 
     # Initialize the tokenizer and data loaders. We require both training and validation data loaders.
     tokenizer = tiktoken.get_encoding(tokenizing_config.tokenizer_name)
-    training_data_loader = create_data_loader(training_loader_config, batch_config, tokenizer)
-    validation_loader = create_data_loader(validation_loader_config, batch_config, tokenizer)
+    training_data_loader = create_data_loader(training_loader_config, batch_config, tokenizer, resume_config)
+    # Do not resume from where we were in the validation loader.
+    validation_loader = create_data_loader(validation_loader_config, batch_config, tokenizer, None)
 
     # Sanity check that our lm_head is at least as big as our tokenizer's vocabulary.
     assert tokenizer.n_vocab <= model_config.vocab_size
     
     # Create the worker threads and work queues to communicate with them.
-    training_batch_queue = create_encoder_worker(tokenizing_config, training_data_loader)
-    validation_batch_queue = create_encoder_worker(tokenizing_config, validation_loader)
+    training_batch_queue = create_encoder_worker(tokenizing_config, training_data_loader, "Training encoder")
+    validation_batch_queue = create_encoder_worker(tokenizing_config, validation_loader, "Validation encoder")
 
     # Create the directory to hold all of our save files.
     run_name = f'run_{training_start}'
     run_dir_path = os.path.join(save_directory, run_name)
     final_model_checkpoint_name = os.path.join(run_dir_path, 'final_model.npz')
     final_optimizer_checkpoint_name = os.path.join(run_dir_path, 'final_opt.safetensors')
+    receipt_name = os.path.join(run_dir_path, 'receipt.json')
     if not no_save:
         os.mkdir(run_dir_path)
  
-    save_queue, save_lock = create_save_worker(model, optimizer, run_dir_path, None)
+    #save_queue, save_lock = create_save_worker(model, optimizer, run_dir_path, None, , "Save weights")
+
+    inference_manager = InferenceManager(model, tokenizer, inference_config.max_tokens_to_generate, inference_config.max_batches, inference_config.prompt, inference_config.k, inference_config.temperature)
 
     # Log to wandb if we're saving the model
     if no_save:
@@ -516,7 +569,21 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
             save_code=True,
             config=training_config
         )
-     
+    run_command = ' '.join(sys.argv)
+    # It is in some sense a miracle that LLM training works at all.
+    print('᚛ᚁᚓᚅᚇᚇᚐᚉᚈᚐᚅᚔᚋᚂ᚜')
+    print('Ailm LLM Trainer')
+    pprint(training_config)
+
+    print(f'Training process pid is {os.getpid()}')
+    print('Training started at', training_start)
+    print("The model has", format_count(parameter_count), "parameters")
+    print('tokens to process', format_count(tokens_to_process))
+    print('step count', step_count)
+    print('gradient_accumulation_steps', gradient_accumulation_steps)
+    print('update count', update_count)
+    print('Saving to', final_model_checkpoint_name)
+
     # Don't listen to the IDE's lies, this is indeed a public API:
     # https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.nn.value_and_grad.html
     # This wraps the model and returns a function which calculates the loss and the corresponding grads for one pass through the model.
@@ -549,9 +616,9 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
         '''Perform an update. Scale and clip the gradients, step the optimizer, and update the weights.'''
         averaged_grads = tree_map(lambda g: (g * gradient_averaging_scale).astype(model_config.dtype), accum_grads)
 
-        gradients, norm = mlx.optimizers.clip_grad_norm(averaged_grads, optimizer_config.gradient_norm_clipping)
+        clipped_gradients, norm = mlx.optimizers.clip_grad_norm(averaged_grads, optimizer_config.gradient_norm_clipping)
 
-        optimizer.update(model, gradients)
+        optimizer.update(model, clipped_gradients)
         return norm
     do_update = mx.compile(do_update, inputs=update_state, outputs=update_state)
     
@@ -573,13 +640,19 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     updates_since_last_log = 0
     last_update_step = 0
 
+    # Mollify the linter in case we never make it through the loop successfully.
+    step = -1
+    training_column = -1
+
+    start_step = resume_config.resume_step if resume_config else 0
+
     # MARK: Training Loop
     try:
         # The training loop. Handles updates and forward passes in one big loop.
         print("Training loop start")
         # Start the stopwatch used to calculate tokens per second.
         training_start = stopwatch_start = time.time()
-        for step in range(step_count):
+        for step in range(start_step, step_count):
 
             prefixes, targets, training_column = training_batch_queue.get(block=True, timeout=tokenizing_config.trainer_stall_seconds)
 
@@ -604,9 +677,9 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
                 total_tokens += batch_config.sequences_per_micro_batch * batch_config.sequence_length * gradient_accumulation_steps
                 update_start = time.time()
                 # The update must be performed while holding the save lock so that the save worker doesn't save a partially updated set of weights.
-                save_lock.acquire()
+                #save_lock.acquire()
                 norm = do_update(accum_grads)
-                save_lock.release()
+                #save_lock.release()
                 # Reset accumulated gradients for the next gradient_accumulation_steps period.
                 accum_grads = None
                 running_grad_norm += norm.item()
@@ -616,27 +689,51 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
 
                 update_step = (step+1) / gradient_accumulation_steps
                 if (update_step % intervals_config.save_interval) == 0 and not no_save:
-                    save_queue.put(step)
+                    # FIXME this currently leads to a sigfault the first time I save, so save synchronously.
+                    #save_queue.put(step)
+                    model.save_weights(final_model_checkpoint_name)
+                    optimizer_state = tree_flatten(optimizer.state, destination={})
+                    optimizer_state = typing.cast(dict[str, Tensor], optimizer_state)
+                    mx.save_safetensors(final_optimizer_checkpoint_name, optimizer_state)
+                    # Save a receipt file with metadata about how this run was started.
+
+                    with open(receipt_name, 'w') as receipt_file:
+                        json.dump({
+                            'step': step,
+                            'current_column': training_column,
+                            'run_command': run_command,
+                            'training_config': training_config,
+                        }, receipt_file)
 
                 # Periodically run validation
                 if (update_step % intervals_config.validation_interval) == 0:
 
+                    validation_start = time.time()
                     validation_result = validate(model, validation_loader, validation_batch_queue, validation_batches, True, tokenizing_config.trainer_stall_seconds)
+                    validation_end = time.time()
+                    validation_duration = validation_end - validation_start
                     if wandb_run:
                         validation_log_message = {
                             'val/loss': validation_result.mean_loss,
                             # 'step': step,
                             'val/perplexity': math.exp(validation_result.mean_loss),
                             'val/column': validation_result.current_column,
+                            'val/duration': validation_duration,
                         }
                         wandb_run.log(validation_log_message)
                         print('Validation:', validation_log_message)
 
+                if intervals_config.inference_interval is not None and (update_step % intervals_config.inference_interval) == 0:
+                    # text = infer(model, tokenizer, max_tokens=inference_config.max_tokens_to_generate, max_batches=inference_config.max_batches, prompt=inference_config.prompt, k=inference_config.k, temperature=inference_config.temperature)
+                    # print(text)
+                    inference_manager.infer()
 
                 # Periodically log to wandb and the terminal
                 if (update_step % intervals_config.log_interval) == 0:
 
                     # Stop the stopwatch which we will use to compute tokens per second.
+                    # Calculating tokens per second and ETA every logging interval makes it so an outlier logging interval,
+                    # for example if my Mac goes to sleep while I carry it to my local cafe, won't affect long term scores permanently.
                     stopwatch_stop = time.time()
                     stopwatch_duration = stopwatch_stop - stopwatch_start
                     step_duration = stopwatch_duration / updates_since_last_log
@@ -646,10 +743,11 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
                     update_duration = update_end - update_start
 
                     # Calculate average gradient norm, loss, and perplexity for this log interval.
-                    steps_since_last_update = step - last_update_step
-                    average_loss_this_update = running_loss / steps_since_last_update
+                    average_loss_this_update = running_loss / (gradient_accumulation_steps * updates_since_last_log)
                     average_grad_norm = running_grad_norm / updates_since_last_log
                     perplexity = math.exp(average_loss_this_update)
+
+                    current_learning_rate = float(optimizer.learning_rate.item())
 
                     # Reset running calculations.
                     running_loss = 0.0
@@ -661,7 +759,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
                         'train/step': step,
                         'train/loss': average_loss_this_update,
                         'train/gradient_norm': average_grad_norm,
-                        'train/learning_rate': optimizer.learning_rate.item(),
+                        'train/learning_rate': current_learning_rate,
                         'train/perplexity': perplexity,
                         'train/tokens_per_second': tokens_per_second,
                         'train/current_column': training_column,
@@ -683,8 +781,6 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
                     # The stopwatch restarts from the moment we last stopped it, that is the beginning of the logging step.
                     stopwatch_start = stopwatch_stop
                 last_update_step = step
-
-                
     finally:
         # Save our last known weights, and try to safely shutdown our worker threads.
         # This should happen if there is an exception, or if we successfully completed training.
@@ -695,10 +791,19 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
                 optimizer_state = tree_flatten(optimizer.state, destination={})
                 optimizer_state = typing.cast(dict[str, Tensor], optimizer_state)
                 mx.save_safetensors(final_optimizer_checkpoint_name, optimizer_state)
+                if step_count:
+                    with open(receipt_name, 'w') as receipt_file:
+                        json.dump({
+                            'step': step,
+                            'current_column': training_column,
+                            'run_command': run_command,
+                            'training_config': training_config,
+                        }, receipt_file)
         finally:
             validation_batch_queue.shutdown()
             training_batch_queue.shutdown()
-            save_queue.shutdown()
+            inference_manager.finish()
+            # save_queue.shutdown()
 
     # Finish the wandb run successfully.
     if wandb_run:
