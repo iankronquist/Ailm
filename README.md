@@ -15,3 +15,31 @@ I drew upon the following resources to design this model:
 - PleIAs's [Baguettotron](https://huggingface.co/PleIAs/Baguettotron)
 
 It uses Apple's MLX framework as it seems to get better performance than other frameworks I've experimented with.
+
+## Installation
+
+Install MLX, tiktoken, and wandb using pip:
+```
+pip install -r requirements.txt
+```
+
+## How to Start Training
+
+First create a config file similar to the ones in the `configs/` directory. Detailed descriptions for the various fields can be found in those config files.
+
+```
+% cp config/muon.yaml your_config.yaml
+% # Edit your_config.yaml to your liking
+```
+
+We recommened using [wandb](https://wandb.ai/). If so, log in with wandb.
+```
+% wandb login
+```
+
+
+Finally start the run:
+```
+python Ailm/train.py your_config.yaml
+``
+
