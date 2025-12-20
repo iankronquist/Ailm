@@ -2,6 +2,8 @@
 
 Ailm is a small Large Language Model designed to be easily trained on an M1 Max Macbook Pro.
 
+To see recent training runs live, checkout our [wandb project](https://wandb.ai/muricula-mus-inc/Ailm/workspace?nw=nwusermuricula).
+
 It is named after the [letter ᚐ, pronounced Ailm](https://en.wikipedia.org/wiki/Ailm) from the Ogham alphabet which was used to write Old Irish.
 
 

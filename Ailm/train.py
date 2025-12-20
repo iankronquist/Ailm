@@ -4,7 +4,6 @@
 An LLM training script.
 '''
 import os
-import signal
 import sys
 import math
 import time
@@ -12,6 +11,7 @@ import json
 import yaml
 import queue
 import random
+import signal
 import typing
 import threading
 import dataclasses
@@ -41,9 +41,9 @@ def handle_pdb(sig, frame):
     import pdb
     pdb.Pdb().set_trace(frame)    
 
-# def name_current_thread(name: str):
-#     '''Give the current NSThread a nice name which shows up in the XCode Instruments profiler'''
-#     Foundation.NSThread.currentThread().setName_(name) # pyright: ignore reportAttributeAccessIssue
+def name_current_thread(name: str):
+    '''Give the current NSThread a nice name which shows up in the XCode Instruments profiler'''
+    Foundation.NSThread.currentThread().setName_(name) # pyright: ignore reportAttributeAccessIssue
 
 def count_params(model: mlx.nn.Module) -> int:
     '''Count the number of parameters in an MLX module. Does not double count modules which share weights.'''
@@ -212,8 +212,15 @@ class InferenceConfig:
     k: int
     temperature: float
 
+# TODO: Add the ability to resume wandb runs: https://docs.wandb.ai/models/runs/resuming
 @dataclasses.dataclass
 class ResumeConfig:
+    '''Used for resuming from a previous run.
+    - resume_weights: A path to the weights file to load, probably an npz or safetensors file.
+    - resume_optimizer: A path to the optimizer state to load, probably a safetensors file.
+    - resume_step: Which step to resume from. Primarily controls where in the learning rate scheduler to start.
+    - resume_column: Which column from the dataset to start from.
+    '''
     resume_weights: str
     resume_optimizer: str
     resume_step: int
@@ -406,8 +413,8 @@ def create_encoder_worker(tokenizing_config: TokenizingConfig, data_loader: Abst
 def encoding_worker(tokenizing_config: TokenizingConfig, encoder_queue: queue.Queue, data_loader: AbstractDataLoader, name: str):
     '''Encoder worker thread. In an infinite loop, encode, push to the queue, and wait until there is room on the queue to encode again.'''
     print('Starting tokenizer worker', name)
-    # if name:
-    #     name_current_thread(name)
+    if name:
+        name_current_thread(name)
     # FIXME This seems to be necessary to fix a strange import bug in the event of a save shutdown
     import queue
     while True:
@@ -438,8 +445,8 @@ def create_save_worker(model: mlx.nn.Module, optimizer: mlx.optimizers.Optimizer
 
 def save_worker(model: mlx.nn.Module, optimizer: mlx.optimizers.Optimizer, run_dir_path: str, save_queue: queue.Queue, save_lock: threading.Lock, name: str):
     print('Starting tokenizer worker', name)
-    # if name:
-    #     name_current_thread(name)
+    if name:
+        name_current_thread(name)
     model_checkpoint_name = os.path.join(run_dir_path, 'model_checkpoint.npz')
     optimizer_checkpoint_name = os.path.join(run_dir_path, 'opt_checkpoint.safetensors')
     # FIXME This seems to be necessary to fix a strange import bug in the event of a save shutdown
@@ -557,7 +564,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
  
     #save_queue, save_lock = create_save_worker(model, optimizer, run_dir_path, None, , "Save weights")
 
-    inference_manager = InferenceManager(model, tokenizer, inference_config.max_tokens_to_generate, inference_config.max_batches, inference_config.prompt, inference_config.k, inference_config.temperature)
+    #inference_manager = InferenceManager(model, tokenizer, inference_config.max_tokens_to_generate, inference_config.max_batches, inference_config.prompt, inference_config.k, inference_config.temperature)
 
     # Log to wandb if we're saving the model
     if no_save:
@@ -726,7 +733,8 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
                 if intervals_config.inference_interval is not None and (update_step % intervals_config.inference_interval) == 0:
                     # text = infer(model, tokenizer, max_tokens=inference_config.max_tokens_to_generate, max_batches=inference_config.max_batches, prompt=inference_config.prompt, k=inference_config.k, temperature=inference_config.temperature)
                     # print(text)
-                    inference_manager.infer()
+                    #inference_manager.infer()
+                    pass
 
                 # Periodically log to wandb and the terminal
                 if (update_step % intervals_config.log_interval) == 0:
@@ -802,7 +810,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
         finally:
             validation_batch_queue.shutdown()
             training_batch_queue.shutdown()
-            inference_manager.finish()
+            #inference_manager.finish()
             # save_queue.shutdown()
 
     # Finish the wandb run successfully.

@@ -10,7 +10,7 @@ I drew upon the following resources to design this model:
     - HuggingFace's SmolLM
     - Facebook's Llama 2
     - GPT-2
-    - Pleia's Baguettron
+    - Pleia's Baguettotron
 
 It uses Apple's MLX framework as it seems to get better performance than other frameworks.
 
@@ -18,6 +18,7 @@ It uses Apple's MLX framework as it seems to get better performance than other f
 
 import dataclasses
 import math
+from abc import ABC, abstractmethod
 
 import mlx
 from mlx import nn

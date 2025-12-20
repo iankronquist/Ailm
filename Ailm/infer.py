@@ -109,11 +109,7 @@ class InferenceManager:
 
 # MARK: Inference   
 
-def infer(model: AilmV1, tokenizer: tiktoken.Encoding, max_tokens: int, max_batches: int, prompt: str, k: int, temperature: float):
-
-    model.train(False)
-    model.reset_key_value_cache(True)
-
+def infer_tokenize(prompt: str, max_tokens, max_batches) -> mx.array:
     # Tokenize the prompt and batch it up.
     tokens = tokenizer.encode(prompt)
     tokens = mx.array(tokens)
@@ -121,6 +117,13 @@ def infer(model: AilmV1, tokenizer: tiktoken.Encoding, max_tokens: int, max_batc
     max_length = max_tokens + prompt_tokens
     batched_tokens = mx.zeros((max_batches, max_length), dtype=mx.uint16)
     batched_tokens[:, 0:prompt_tokens] = tokens
+    return batched_tokens
+
+
+def infer(model: AilmV1, tokenizer: tiktoken.Encoding, max_tokens: int, max_batches: int, prompt_tokens: int, batched_tokens: mx.array, k: int, temperature: float):
+
+    model.train(False)
+    model.reset_key_value_cache(True)
 
     for i in (range(max_tokens)):
 

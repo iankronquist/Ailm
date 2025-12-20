@@ -92,6 +92,7 @@ class FineWebDataLoader(AbstractDataLoader):
         if self.next_encoded is None:
             t0 = time.time()
 
+            # TODO: Consider using encode_to_numpy
             tokens_list = [self.eot] + self.encoder.encode(self.get_column(self.current_column), allowed_special={'<|endoftext|>',})
 
             self.next_encoded = mlx.core.array(tokens_list, dtype=self.dtype)
