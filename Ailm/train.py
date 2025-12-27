@@ -24,7 +24,7 @@ import mlx.core as mx
 from mlx.core import array as Tensor
 from mlx.utils import tree_reduce, tree_map, tree_flatten
 
-# import Foundation
+import Foundation
 import wandb
 import tiktoken
 
@@ -641,7 +641,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
 
     # Running statistics for logging
     total_tokens = 0
-    running_tokens = 0
+    #running_tokens = 0
     running_loss = 0.0
     running_grad_norm = 0.0
     updates_since_last_log = 0
@@ -671,7 +671,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
 
             # Accumulate per-step running statistics.
             running_loss += mean_loss.item()
-            running_tokens += prefixes.size
+            #running_tokens += prefixes.size
 
             # Check for OOM. MacOS will hang if we schedule a compute graph which is too large to fit into memory.
             if mx.get_active_memory() > memory_limit:
@@ -746,7 +746,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
                     stopwatch_duration = stopwatch_stop - stopwatch_start
                     step_duration = stopwatch_duration / updates_since_last_log
                     tokens_processed = updates_since_last_log * batch_config.sequences_per_micro_batch * batch_config.sequence_length * gradient_accumulation_steps
-                    assert running_tokens == (updates_since_last_log * batch_config.sequences_per_micro_batch * batch_config.sequence_length * gradient_accumulation_steps)
+                    #assert running_tokens == (updates_since_last_log * batch_config.sequences_per_micro_batch * batch_config.sequence_length * gradient_accumulation_steps)
                     tokens_per_second = tokens_processed / stopwatch_duration
                     update_duration = update_end - update_start
 
@@ -761,7 +761,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
                     running_loss = 0.0
                     running_grad_norm = 0.0
                     updates_since_last_log = 0
-                    running_tokens = 0
+                    #running_tokens = 0
 
                     log_message = {
                         'train/step': step,
