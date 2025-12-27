@@ -203,6 +203,18 @@ class CausalSelfAttention(nn.Module):
         v = v.reshape(B, T, self.key_value_head_count, self.head_dim)
         v = mlx.core.swapaxes(v, 1, 2)
 
+        if self.use_kv_cache and self.k_cache is not None:
+            # If we have a cache, the new tokens should have positions starting after the cache
+            offset = self.k_cache.shape[2]  # Cache shape is (B, H, Seq, D)
+            shape = self.k_cache.shape
+        else:
+            offset = 0
+            shape = k.shape
+
+        # Apply Rotational Positional Embeddings.
+        q = self.rope(q, offset=offset)
+        k = self.rope(k, offset=offset)
+
         # Extract cached entries if necessary.
         if self.use_kv_cache:
             if self.k_cache is None or self.v_cache is None:
@@ -217,20 +229,17 @@ class CausalSelfAttention(nn.Module):
             k = self.k_cache
             v = self.v_cache
 
-        # Apply Rotational Positional Embeddings.
-        q = self.rope(q)
-        k = self.rope(k)
-
-        # Scaled dot product attention. Apply causal masking if we're not using KV caching.
-        mask = None if self.use_kv_cache else "causal"
+        # Scaled dot product attention with causal masking.
+        if self.use_kv_cache:
+            # If we are using KV caching, and the length of our input sequence is 1, 
+            # we can skip the causal mask as a performance optimization.
+            mask = "causal" if T > 1 else None
+        else:
+            mask = "causal"
         y = mlx.core.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask, sinks=self.sinks)
 
-        # Performance optimization: If we're using KV caching, we don't actually need to send any of the cached context on from here.
-        if self.use_kv_cache:
-            y = y[:, :, -1:, :].transpose(0, 2, 1, 3).reshape([B, 1, C])
-        else:
-            # Reshape the tensor so it's laid out like the original residual stream.
-            y = y.transpose(0, 2, 1, 3).reshape([B, T, C])
+        # Reshape the tensor so it's laid out like the original residual stream.
+        y = y.transpose(0, 2, 1, 3).reshape([B, T, C])
 
         # Project back to the residual stream space.
         y = self.c_proj(y)
