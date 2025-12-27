@@ -31,7 +31,7 @@ learning_rate_schedule:
   learning_rate_max: 0.003
   learning_rate_min: 0.0003
   # This figure was chosen for wildly different training sizes in my survey. I may want to revisit it.
-  warmup_steps: 2000
+  warmup_percent: 5
 
 optimizer:
   name: adamw
@@ -48,11 +48,13 @@ optimizer:
 training_data_loader:
   kind: fineweb
   directory: datasets/fineweb_edu_sample
+  shuffle: true
 
 # I took the last, smaller parquet file from fineweb edu 20B and called it a validation set.
 validation_data_loader:
   kind: fineweb
   directory: datasets/fineweb_edu_sample/validate
+  shuffle: true
 
 batching:
   # Modern LLMs use sequence lengths of around 2048-4096.
@@ -68,9 +70,10 @@ batching:
 # Intervals at which to perform various expensive tasks.
 # These are expressed in terms of full batch steps, not microbatch steps.
 intervals:
-  save_interval: 10
-  validation_interval: 10
+  save_interval: 100
+  validation_interval: 100
   log_interval: 1
+  inference_interval: 100
 
 
 tokenizing:
