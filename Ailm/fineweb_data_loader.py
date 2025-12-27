@@ -12,6 +12,8 @@ import typing
 import mlx.core
 from mlx.core import array as Tensor
 
+import numpy as np
+
 import datasets
 
 from abc import ABC, abstractmethod
@@ -31,11 +33,15 @@ class AbstractDataLoader(ABC): # Inherit from ABC
         pass
 
 class FineWebDataLoader(AbstractDataLoader):
-    def __init__(self, B: int, T: int, file_path: str, tokenizer: tiktoken.Encoding, subset='train', start_column=None, feature='text', shuffle=False):
+    def __init__(self, B: int, T: int, file_path: str, tokenizer: tiktoken.Encoding, subset='train', start_column=None, feature='text', shuffle=False, allowed_special_tokens: typing.Optional[set[str]] = None):
         self.durations = []
         self.shuffle = shuffle
         self.B = B
         self.T = T
+        self.subset = subset
+        self.feature = feature
+        self.allowed_special_tokens = allowed_special_tokens or {'<|endoftext|>',}
+
         if isinstance(file_path, list):
             parquets = file_path
         else:
@@ -43,7 +49,8 @@ class FineWebDataLoader(AbstractDataLoader):
 
         dataset = datasets.load_dataset('parquet', data_files=parquets)
         dataset = typing.cast(datasets.DatasetDict, dataset)
-        self.dataset: typing.List = dataset[subset][feature]
+        #self.dataset: typing.List = dataset[subset][feature]
+        self.dataset = dataset
         self.tokens = None
         self.tokens_pos = 0
 
@@ -72,6 +79,9 @@ class FineWebDataLoader(AbstractDataLoader):
         self.encoded = None
         self.next_encoded = None
 
+    def get_column_text(self, index):
+        return self.dataset[self.subset][self.feature][index]
+
     #def __del__(self):
     #    self.progress_bar.close()
     #def batches_per_epoch(self):
@@ -87,13 +97,13 @@ class FineWebDataLoader(AbstractDataLoader):
     def get_column(self, index):
         if self.shuffle:
             index = self.shuffled_indices[index]
-        return self.dataset[index]
+        return self.get_column_text(index)
     def encode(self):
         if self.next_encoded is None:
             t0 = time.time()
 
             # TODO: Consider using encode_to_numpy
-            tokens_list = [self.eot] + self.encoder.encode(self.get_column(self.current_column), allowed_special={'<|endoftext|>',})
+            tokens_list = [self.eot] + self.encoder.encode(self.get_column(self.current_column), allowed_special=self.allowed_special_tokens)
 
             self.next_encoded = mlx.core.array(tokens_list, dtype=self.dtype)
             t1 = time.time()
@@ -116,6 +126,9 @@ class FineWebDataLoader(AbstractDataLoader):
 
     def view(self, tensor, B, T):
         return tensor.reshape((B, T))
+    
+    def filter_column(self, index: int) -> bool:
+        return False
 
     def next_column(self):
         #print('column', self.current_column)
@@ -138,6 +151,8 @@ class FineWebDataLoader(AbstractDataLoader):
         self.tokens = self.get_encoded()
         self.tokens_pos = 0
         self.current_column += 1
+        while self.filter_column(self.current_column):
+            self.current_column += 1
         return self.tokens
     
     def peek_batch(self):
