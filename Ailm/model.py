@@ -26,6 +26,22 @@ from mlx.core import array as Tensor
 import mlx.core
 
 
+DTYPE_NAME_TO_MLX_DTYPE = {
+        'bf16': mlx.core.bfloat16,
+        'bloatf16': mlx.core.bfloat16,
+        'f16': mlx.core.float16,
+        'floatf16': mlx.core.float16,
+        'f32': mlx.core.float32,
+        'floatf32': mlx.core.float32,
+}
+
+def dtype_name_to_mlx_dtype(name: str) -> mlx.core.Dtype:
+    if name not in DTYPE_NAME_TO_MLX_DTYPE:
+        raise ValueError(
+            f"Unrecognized dtype '{name}'. "
+            f"Valid options: {', '.join(DTYPE_NAME_TO_MLX_DTYPE.keys())}"
+        )
+    return DTYPE_NAME_TO_MLX_DTYPE[name]
 @dataclasses.dataclass
 class AilmV1Config:
     '''
@@ -48,18 +64,6 @@ class AilmV1Config:
     - no_rms_norm_weight: Disable weights on RMS norms. Empirically they are all set to 1. This saves a few parameters.
     '''
 
-    # This config is more like baguettotron. It's leaner and deeper.
-    # At our current rate of 5.5k tokens per second, with this config it will take us just over 3 days
-    # vocab_size: int = 50304
-    # layer_count: int = 30
-    # head_count: int = 9
-    # hidden_size: int = 576
-    # key_value_head_count: int = 3
-    # dtype: mlx.core.Dtype = mlx.core.bfloat16
-    # mlp_size: int = 1536
-    # use_kv_cache: bool = False
-    # use_attention_sinks: bool = True
-
     # This config is more like gpt2 small.
     # At our current rate of 7.5k tokens per second, with this config it will take us just over 3 days
     use_kv_cache: bool = False
@@ -72,6 +76,18 @@ class AilmV1Config:
     dtype: mlx.core.Dtype = mlx.core.bfloat16
     use_attention_sinks: bool = True
     no_rms_norm_weight: bool = True
+
+    # This config is more like baguettotron. It's leaner and deeper.
+    # At our current rate of 5.5k tokens per second, with this config it will take us just over 3 days
+    # vocab_size: int = 50304
+    # layer_count: int = 30
+    # head_count: int = 9
+    # hidden_size: int = 576
+    # key_value_head_count: int = 3
+    # dtype: mlx.core.Dtype = mlx.core.bfloat16
+    # mlp_size: int = 1536
+    # use_kv_cache: bool = False
+    # use_attention_sinks: bool = True
 
     # This config is more like gpt2 medium.
     # At our current rate of 2.4k tokens per second with this config it will take us 28 days on my M1 max
@@ -91,6 +107,11 @@ class AilmV1Config:
         dictionary['dtype'] = str(dictionary['dtype'])
         return dictionary
 
+    def __post_init__(self):
+        # If dtype was provided as a name eg from a config file, translate it to the corresponding MLX dtype.
+        if isinstance(self.dtype, str):
+            name = self.dtype.strip().lower()
+            self.dtype = dtype_name_to_mlx_dtype(name)
 
 def _init_weights(_name: str, module: nn.Module):
     '''
@@ -341,9 +362,11 @@ class AilmV1(nn.Module):
 
         # Initialize the model's weights.
         self.apply_to_modules(_init_weights)
+        self.set_dtype(config.dtype)
 
         # In order to reduce the number of parameters, we tie the input embeddings to the language model head.
         self.transformer.wte.weight = self.lm_head.weight
+
 
     def __call__(self, ids: Tensor) -> Tensor:
         '''

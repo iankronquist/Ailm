@@ -34,13 +34,12 @@ class AbstractDataLoader(ABC): # Inherit from ABC
 
 class FineWebDataLoader(AbstractDataLoader):
     def __init__(self, B: int, T: int, file_path: str, tokenizer: tiktoken.Encoding, subset='train', start_column=None, feature='text', shuffle=False, allowed_special_tokens: typing.Optional[set[str]] = None):
-        self.durations = []
         self.shuffle = shuffle
         self.B = B
         self.T = T
         self.subset = subset
         self.feature = feature
-        self.allowed_special_tokens = allowed_special_tokens or {'<|endoftext|>',}
+        self.allowed_special_tokens = (allowed_special_tokens or set()) | {'<|endoftext|>',}
 
         if isinstance(file_path, list):
             parquets = file_path
@@ -55,7 +54,7 @@ class FineWebDataLoader(AbstractDataLoader):
         self.tokens_pos = 0
 
         if self.shuffle:
-            self.shuffled_indices = (list(range(len(self.dataset))))
+            self.shuffled_indices = (list(range(len(self.dataset[self.subset]))))
             random.shuffle(self.shuffled_indices)
 
         self.encoder = tokenizer
@@ -94,28 +93,33 @@ class FineWebDataLoader(AbstractDataLoader):
     def percent(self):
         return self.current_column / len(self.dataset) * 100
 
-    def get_column(self, index):
+    def _get_column_index(self, index: int) -> int:
         if self.shuffle:
             index = self.shuffled_indices[index]
+        return index
+
+    def get_column(self, index):
+        while True:
+            index = self._get_column_index(index)
+            if not self.filter_column(index):
+                break
+            self.current_column += 1
+
         return self.get_column_text(index)
     def encode(self):
         if self.next_encoded is None:
-            t0 = time.time()
-
             # TODO: Consider using encode_to_numpy
             tokens_list = [self.eot] + self.encoder.encode(self.get_column(self.current_column), allowed_special=self.allowed_special_tokens)
 
             self.next_encoded = mlx.core.array(tokens_list, dtype=self.dtype)
-            t1 = time.time()
-            self.durations.append(t1 - t0)
 
     def get_encoded(self):
         if self.next_encoded is None:
             self.encode()
         assert self.next_encoded is not None
-        self.encoded = self.next_encoded
+        next = self.next_encoded
         self.next_encoded = None
-        return self.encoded
+        return next
 
     def reset(self):
         self.current_position = 0
@@ -131,8 +135,7 @@ class FineWebDataLoader(AbstractDataLoader):
         return False
 
     def next_column(self):
-        #print('column', self.current_column)
-        if self.current_column >= len(self.dataset):
+        if self.current_column >= len(self.dataset[self.subset]):
             self.current_column = 0
             self.epoch += 1
             if self.progress_bar:
@@ -141,13 +144,6 @@ class FineWebDataLoader(AbstractDataLoader):
         if self.progress_bar:
             self.progress_bar.update(1)
 
-        #t0 = time.time()
-        #if self.backend == SimpleDataLoaderBackend.Torch:
-        #    self.tokens = torch.tensor([self.eot] + self.encoder.encode(self.dataset[self.current_column], allowed_special={'<|endoftext|>',}), dtype=self.dtype)
-        #else:
-        #    self.tokens = mlx.core.array([self.eot] + self.encoder.encode(self.dataset[self.current_column], allowed_special={'<|endoftext|>',}), dtype=self.dtype)
-        #t1 = time.time()
-        #self.durations.append(t1 - t0)
         self.tokens = self.get_encoded()
         self.tokens_pos = 0
         self.current_column += 1
@@ -164,8 +160,6 @@ class FineWebDataLoader(AbstractDataLoader):
         batch_pos = 0
         while batch_pos < len(self.batch):
             if self.tokens_pos == 0:
-                #self.batch[batch_pos] = self.eot
-                #batch_pos += 1
                 if batch_pos == len(self.batch):
                     break
                 self.next_column()

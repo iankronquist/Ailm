@@ -94,7 +94,8 @@ class QaReasoningComboTextDataLoader(QaReasoningDataLoader):
         synthetic_reasoning = column['synthetic_reasoning']
         synthetic_answer = column['synthetic_answer']
 
-        return f'''{seed_text}<|endoftext|><user>{query}</user><think>{synthetic_reasoning}</think><agent>{synthetic_answer}</agent>'''
+        text = f'''{seed_text}<|endoftext|><user>{query}</user><think>{synthetic_reasoning}</think><agent>{synthetic_answer}</agent>'''
+        return text
     
     # def filter_column(self, index: int) -> bool:
     #     return False

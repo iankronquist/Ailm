@@ -8,6 +8,7 @@ import sys
 import math
 import time
 import json
+import psutil
 import yaml
 import queue
 import random
@@ -28,9 +29,11 @@ import Foundation
 import wandb
 import tiktoken
 
+from model_utils import model_name_to_class_and_config
 from infer import InferenceManager, infer
-from model import AilmV1Config, AilmV1
+from model import AilmV1Config, AilmV1, dtype_name_to_mlx_dtype
 from fineweb_data_loader import FineWebDataLoader, AbstractDataLoader
+from q_and_a_data_loader import QaReasoningComboTextDataLoader
 
 # MARK: Utilities
 
@@ -39,7 +42,27 @@ TERMINAL_COLOR_RESET='\033[0m'
 
 def handle_pdb(sig, frame):
     import pdb
-    pdb.Pdb().set_trace(frame)    
+    pdb.Pdb().set_trace(frame) 
+
+def running_under_pdb() -> bool:
+    return 'pdb' in sys.modules
+
+def running_caffeinated() -> bool:
+    '''Check if we were started using the caffeinate utility.
+    Caffeinate on macOS will take a power assertion as long as we the current process exists. It's typically used like this: `caffeinate -- python Ailm/train.py config/example.yaml`.
+    caffeinate basically works by forking, after which the parent execs the command line (our process), while the child takes the power assertion and waits for its parent to exit, whereupon it will release the power assertion.
+    This function will not currently detect if you're running with `caffeinate -w $OUR_PID`, only if you've invoked the process with caffeinate initially.
+    '''
+
+    # TOOD: We could parse the output of `pmset -g assertions` instead which would be more authoritative and accurate but this is a straightforward reminder.
+    us = psutil.Process()
+    return any([child.name() == 'caffeinate' for child in  us.children()])   
+
+def warn(*args, **kwargs):
+    '''Print a warning in red to stderr colored red with ANSI terminal escape sequences.'''
+    if 'file' in kwargs.keys():
+        kwargs.pop('file')
+    print(TERMINAL_COLOR_RED, *args, TERMINAL_COLOR_RESET, **kwargs, file=sys.stderr)
 
 def name_current_thread(name: str):
     '''Give the current NSThread a nice name which shows up in the XCode Instruments profiler'''
@@ -60,6 +83,16 @@ def count_params(model: mlx.nn.Module) -> int:
     params_count = tree_reduce(accum_if_not_seen, model, 0)
     params_count = typing.cast(int, params_count)
     return params_count
+
+@mx.compile
+def has_nan(x: Tensor) -> Tensor:
+    return mx.any(mx.isnan(x))
+
+@mx.compile
+def has_nan_tree(x):
+    return tree_reduce(
+        lambda accum, x: accum | mx.any(mx.isnan(x)),
+        x, Tensor(False))
 
 def format_count(count: int):
     '''Given a count (eg of parameters), return a string in a more easily readable format.'''
@@ -182,6 +215,7 @@ class TokenizingConfig:
     tokenizer_queue_length: int
     encoder_stall_seconds: int
     trainer_stall_seconds: int
+    extra_tokens: typing.Optional[list[str]] = None
 
 @dataclasses.dataclass
 class IntervalsConfig:
@@ -322,28 +356,66 @@ def create_learning_rate_scheduler(optimizer_config: LearningRateScheduleConfig,
     else:
         raise NotImplementedError(f'optimizer schedule kind "{optimizer_config.kind}" is not implemented')
 
-def create_data_loader(data_loader_config: DataLoaderConfig, batch_config: BatchConfig, tokenizer: tiktoken.Encoding, resume_config: typing.Optional[ResumeConfig]) -> AbstractDataLoader:
+def create_tokenizer(tokenizer_config: TokenizingConfig) -> tiktoken.Encoding:
+    '''
+    Create a tokenizer from the provided config. The config provides a base name and optionally extra tokens for eg thinking or chat.
+    '''
+    tokenizer = tiktoken.get_encoding(tokenizer_config.tokenizer_name)
+    # If there are extra tokens, eg for thinking, override the built in config.
+    if tokenizer_config.extra_tokens:
+        base_tokenizer = tokenizer
+        n_vocab = base_tokenizer.n_vocab
+
+        extra_tokens: dict[str, int] = dict()
+        for (i, token_str) in enumerate(tokenizer_config.extra_tokens):
+            extra_tokens[token_str] = n_vocab + i
+
+        tokenizer = tiktoken.Encoding(
+            name=tokenizer_config.tokenizer_name + "_custom",
+            pat_str=base_tokenizer._pat_str,
+            mergeable_ranks=base_tokenizer._mergeable_ranks,
+            special_tokens={**base_tokenizer._special_tokens, **extra_tokens},
+        )
+    return tokenizer
+
+
+def create_data_loader(data_loader_config: DataLoaderConfig, batch_config: BatchConfig, tokenizer: tiktoken.Encoding, tokenizer_config: TokenizingConfig, resume_config: typing.Optional[ResumeConfig]) -> AbstractDataLoader:
     '''Create a data loader from a data loader config.'''
 
     start_column = resume_config.resume_column if resume_config else 0
 
     if data_loader_config.kind == 'fineweb':
         return FineWebDataLoader(batch_config.sequences_per_micro_batch, batch_config.sequence_length, data_loader_config.directory, tokenizer, start_column=start_column, shuffle=data_loader_config.shuffle)
+    if data_loader_config.kind == 'synth_combo':
+        allowed_special_tokens = None
+        if tokenizer_config.extra_tokens:
+            allowed_special_tokens = set(tokenizer_config.extra_tokens)
+        return QaReasoningComboTextDataLoader(batch_config.sequences_per_micro_batch, batch_config.sequence_length, data_loader_config.directory, tokenizer, start_column=start_column, shuffle=data_loader_config.shuffle, allowed_special_tokens=allowed_special_tokens)
     raise NotImplementedError(f"Unknown data loader kind {data_loader_config.kind}")
 
-def create_model(training_config: dict, resume_config: typing.Optional[ResumeConfig]) -> tuple[AilmV1, AilmV1Config]:
+def create_model(training_config: dict, resume_weights: typing.Optional[str], grad_scaling_dtype: typing.Optional[mx.Dtype]) -> tuple[AilmV1, AilmV1, AilmV1Config]:
     '''Create the model from the training config'''
-    # For now we only support AilmV1, but I may want to change the architecture later.
-    assert training_config['model_name'] == 'AilmV1'
+
+    # Lookup the appropriate model and model config classes specified by the config file. For example, if you specify model_name: AilmV2 in the config file you should get AilmV2 and AilmV2Config.
+    model_class, config_class = model_name_to_class_and_config(training_config['model_name'])
+
     # Initialize the model config from the relevant section of the training config if present.
     training_config_model_section = training_config.get('model_config') or {}
-    model_config = AilmV1Config(*training_config_model_section)
+    model_config = config_class(**training_config_model_section)
 
     # Initialize the model.
-    model = AilmV1(model_config)
-    if resume_config:
-        model.load_weights(resume_config.resume_weights)
-    return model, model_config
+    model = model_class(model_config)
+    if resume_weights:
+        model.load_weights(resume_weights)
+
+    if grad_scaling_dtype:
+        scaled_model_config = config_class(**training_config_model_section)
+        scaled_model_config.dtype = grad_scaling_dtype
+        scaled_model = model_class(scaled_model_config)
+        sync_weights(scaled_model, model, grad_scaling_dtype)
+    else:
+        scaled_model = model
+    return scaled_model, model, model_config
 
 def create_optimizer(optimizer_config: OptimizerConfig, resume_config: typing.Optional[ResumeConfig], learning_rate_schedule: typing.Union[float, typing.Callable[[mx.array], mx.array]]) -> mlx.optimizers.Optimizer:
     '''Create the optimizer for our training run.'''
@@ -382,7 +454,7 @@ class ValidationResult:
     mean_loss: float
     current_column: int
 
-def validate(model: mlx.nn.Module, val_loader: AbstractDataLoader, val_queue: queue.Queue, num_batches: int, should_reset: bool, stall_secs: int) -> ValidationResult:
+def validate(model: mlx.nn.Module, val_loader: AbstractDataLoader, val_queue: queue.Queue[typing.Tuple[Tensor, Tensor, int]], num_batches: int, should_reset: bool, stall_secs: int, loss_fn: typing.Callable[[mlx.nn.Module, Tensor, Tensor], Tensor]) -> ValidationResult:
     """Run validation and return average loss and perplexity"""
     total_loss = 0.0
     if should_reset:
@@ -463,6 +535,20 @@ def save_worker(model: mlx.nn.Module, optimizer: mlx.optimizers.Optimizer, run_d
         except queue.ShutDown:
             break
 
+# MARK: Gradient scaling & weight synchronization
+
+def sync_weights(dst: AilmV1, src: AilmV1, dtype: mx.Dtype):
+    '''Cast the src weights to the provided dtype and use the result to update the dst module.'''
+    # Perf optimization if this is a no-op. This occurs when we're only maintaining one set of model weights.
+    if dst == src:
+        return
+    # Perf optimization when no casting is required.
+    if src.config.dtype == dtype:
+        dst.update(src)
+        return
+    # Cast all src buffers to dtype and set dst's state to the result.
+    dst.update(tree_map(lambda x: x.astype(dtype), src))
+
 # MARK: Training
 
 def train_model(training_config: dict[str, typing.Any], save_directory: str, no_save: bool):
@@ -475,7 +561,8 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     training_start = time.strftime("%Y%m%d-%H%M")
 
     # HACK: It seems kind of janky but if I send SIGUSR1 to the training process I should be able to break into it with PDB and edit things on the fly.
-    signal.signal(signal.SIGUSR1, handle_pdb)
+    if not no_save:
+        signal.signal(signal.SIGUSR1, handle_pdb)
 
     # Initialize config objects.
     learning_rate_schedule_config = LearningRateScheduleConfig(**config['learning_rate_schedule'])
@@ -503,8 +590,14 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     random.seed(rng_seed)
     mx.random.seed(rng_seed)
 
-    # TODO: Optionally reload module weights if the training config specifies them.
-    model, model_config = create_model(training_config, resume_config)
+    # Optional gradient scaling factor if we're training in f16.
+    gradient_scaling_factor = training_config.get('gradient_scaling_factor')
+    gradient_dtype = training_config.get('gradient_dtype')
+    if gradient_dtype:
+        gradient_dtype = dtype_name_to_mlx_dtype(gradient_dtype)
+
+    resume_weights = resume_config.resume_weights if resume_config is not None else None
+    update_weights, model, model_config = create_model(training_config, resume_weights, gradient_dtype)
 
     parameter_count = count_params(model)
 
@@ -540,11 +633,13 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     # Create the optimizer for our training run.
     optimizer = create_optimizer(optimizer_config, resume_config, learning_rate_schedule)
 
+    # Initialize our tokenizer including any tokens we added from our config file.
+    tokenizer = create_tokenizer(tokenizing_config)
+
     # Initialize the tokenizer and data loaders. We require both training and validation data loaders.
-    tokenizer = tiktoken.get_encoding(tokenizing_config.tokenizer_name)
-    training_data_loader = create_data_loader(training_loader_config, batch_config, tokenizer, resume_config)
+    training_data_loader = create_data_loader(training_loader_config, batch_config, tokenizer, tokenizing_config, resume_config)
     # Do not resume from where we were in the validation loader.
-    validation_loader = create_data_loader(validation_loader_config, batch_config, tokenizer, None)
+    validation_loader = create_data_loader(validation_loader_config, batch_config, tokenizer, tokenizing_config, resume_config=None)
 
     # Sanity check that our lm_head is at least as big as our tokenizer's vocabulary.
     assert tokenizer.n_vocab <= model_config.vocab_size
@@ -562,9 +657,10 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     if not no_save:
         os.mkdir(run_dir_path)
  
+    # Multi threaded saving causes segfaults. When we save on another thread, MLX will eval the arrays, which is actually something I hoped to avoid. MLX then accesses some sort of thread local state and crashes. I haven't finished tracking down the issue, but have disabled multi threaded saving for now.
     #save_queue, save_lock = create_save_worker(model, optimizer, run_dir_path, None, , "Save weights")
 
-    #inference_manager = InferenceManager(model, tokenizer, inference_config.max_tokens_to_generate, inference_config.max_batches, inference_config.prompt, inference_config.k, inference_config.temperature)
+    inference_manager = InferenceManager(model, tokenizer, inference_config.max_tokens_to_generate, inference_config.max_batches, inference_config.prompt, inference_config.k, inference_config.temperature)
 
     # Log to wandb if we're saving the model
     if no_save:
@@ -611,6 +707,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
             new_grads = tree_map(mx.add, accum_grads, grads)
             # Delete the old grads so we don't have to wait for the GC to reuse this memory.
             del accum_grads
+        del grads
 
         return (loss, new_grads)
     do_step = mx.compile(do_step, inputs=step_state, outputs=step_state)
@@ -618,20 +715,35 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     # I haven't benchmarked it rigorously, but I suspect it may be faster to use multiplication than division.
     gradient_averaging_scale = mx.array(1.0 / gradient_accumulation_steps)
 
-    update_state = [model.state, optimizer.state]
+    # update_state = [model.state, optimizer.state]
+    # def do_update(accum_grads: Tensor) -> Tensor:
+    #     '''Perform an update. Scale and clip the gradients, step the optimizer, and update the weights.'''
+    #     averaged_grads = tree_map(lambda g: (g * gradient_averaging_scale).astype(model_config.dtype), accum_grads)
+
+    #     clipped_gradients, norm = mlx.optimizers.clip_grad_norm(averaged_grads, optimizer_config.gradient_norm_clipping)
+
+    #     optimizer.update(model, clipped_gradients)
+    #     return norm
+
+    update_state = [model.state, update_weights.state, optimizer.state]
     def do_update(accum_grads: Tensor) -> Tensor:
         '''Perform an update. Scale and clip the gradients, step the optimizer, and update the weights.'''
-        averaged_grads = tree_map(lambda g: (g * gradient_averaging_scale).astype(model_config.dtype), accum_grads)
+        averaged_grads = tree_map(lambda g: (g * gradient_averaging_scale), accum_grads)
 
         clipped_gradients, norm = mlx.optimizers.clip_grad_norm(averaged_grads, optimizer_config.gradient_norm_clipping)
 
-        optimizer.update(model, clipped_gradients)
+        optimizer.update(update_weights, clipped_gradients)
+        sync_weights(model, update_weights, model.config.dtype)
         return norm
     do_update = mx.compile(do_update, inputs=update_state, outputs=update_state)
     
+    # This warning is incorrect. It's actually a kind of unit confusion -- save interval is in the unit of updates while gradient_accumulation_steps is in the unit of steps.
+    # It might still be useful to have a warning like this, but it would need to relate the time it takes to tokenize a column with the time it takes to do a mini batch, which isn't trivial.
+    # if gradient_accumulation_steps <= intervals_config.save_interval * 10:
+    #     warn(f"Warning: gradient accumulation steps {gradient_accumulation_steps} is close to the save interval {intervals_config.save_interval}. We may wind up stalling the GPU waiting for tokenization.")
 
-    if gradient_accumulation_steps <= intervals_config.save_interval * 10:
-        print(f"{TERMINAL_COLOR_RED}Warning: gradient accumulation steps {gradient_accumulation_steps} is close to the save interval {intervals_config.save_interval}. We may wind up stalling the GPU waiting for tokenization.{TERMINAL_COLOR_RESET}")
+    if not running_caffeinated():
+        warn("Warning: This process was not started using the caffeinate utility. If we're running on a device which may sleep or enter low power mode, long training runs may be delayed.")
 
     # MacOS will hang if the compute graph grows beyond the size of memory, so in order to crash instead of hanging we set a memory limit from the training config.
     memory_limit = training_config['memory_limit']
@@ -641,17 +753,16 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
 
     # Running statistics for logging
     total_tokens = 0
-    #running_tokens = 0
     running_loss = 0.0
     running_grad_norm = 0.0
     updates_since_last_log = 0
-    last_update_step = 0
 
     # Mollify the linter in case we never make it through the loop successfully.
     step = -1
     training_column = -1
 
     start_step = resume_config.resume_step if resume_config else 0
+
 
     # MARK: Training Loop
     try:
@@ -668,10 +779,18 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
             # We need to evaludate our gradients every step to prevent the compute graph from exploding
             mx.eval(mean_loss)
             mx.eval(accum_grads)
+            
+            if mx.isnan(mean_loss).item():
+                warn('Loss is nan! Breaking into debugger.')
+                # Do not save the corrupted state.
+                no_save = True
+                import pdb
+                pdb.set_trace()
+            # grads_nans = has_nan_tree(accum_grads).item()
+            # assert not grads_nans
 
             # Accumulate per-step running statistics.
             running_loss += mean_loss.item()
-            #running_tokens += prefixes.size
 
             # Check for OOM. MacOS will hang if we schedule a compute graph which is too large to fit into memory.
             if mx.get_active_memory() > memory_limit:
@@ -687,6 +806,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
                 #save_lock.acquire()
                 norm = do_update(accum_grads)
                 #save_lock.release()
+
                 # Reset accumulated gradients for the next gradient_accumulation_steps period.
                 accum_grads = None
                 running_grad_norm += norm.item()
@@ -696,27 +816,20 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
 
                 update_step = (step+1) / gradient_accumulation_steps
                 if (update_step % intervals_config.save_interval) == 0 and not no_save:
-                    # FIXME this currently leads to a sigfault the first time I save, so save synchronously.
-                    #save_queue.put(step)
-                    model.save_weights(final_model_checkpoint_name)
-                    optimizer_state = tree_flatten(optimizer.state, destination={})
-                    optimizer_state = typing.cast(dict[str, Tensor], optimizer_state)
-                    mx.save_safetensors(final_optimizer_checkpoint_name, optimizer_state)
-                    # Save a receipt file with metadata about how this run was started.
-
-                    with open(receipt_name, 'w') as receipt_file:
-                        json.dump({
-                            'step': step,
-                            'current_column': training_column,
-                            'run_command': run_command,
-                            'training_config': training_config,
-                        }, receipt_file)
+                    save_state(model, final_model_checkpoint_name, optimizer, final_optimizer_checkpoint_name, receipt_name, {
+                                'step': step,
+                                'wandb_run_name': wandb_run.name if wandb_run else None,
+                                'current_column': training_column,
+                                'total_tokens': total_tokens,
+                                'run_command': run_command,
+                                'training_config': training_config,
+                            })
 
                 # Periodically run validation
                 if (update_step % intervals_config.validation_interval) == 0:
 
                     validation_start = time.time()
-                    validation_result = validate(model, validation_loader, validation_batch_queue, validation_batches, True, tokenizing_config.trainer_stall_seconds)
+                    validation_result = validate(model, validation_loader, validation_batch_queue, validation_batches, True, tokenizing_config.trainer_stall_seconds, loss_fn)
                     validation_end = time.time()
                     validation_duration = validation_end - validation_start
                     if wandb_run:
@@ -733,8 +846,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
                 if intervals_config.inference_interval is not None and (update_step % intervals_config.inference_interval) == 0:
                     # text = infer(model, tokenizer, max_tokens=inference_config.max_tokens_to_generate, max_batches=inference_config.max_batches, prompt=inference_config.prompt, k=inference_config.k, temperature=inference_config.temperature)
                     # print(text)
-                    #inference_manager.infer()
-                    pass
+                    inference_manager.infer()
 
                 # Periodically log to wandb and the terminal
                 if (update_step % intervals_config.log_interval) == 0:
@@ -795,28 +907,33 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
         try:
             if not no_save:
                 # Save final state
-                model.save_weights(final_model_checkpoint_name)
-                optimizer_state = tree_flatten(optimizer.state, destination={})
-                optimizer_state = typing.cast(dict[str, Tensor], optimizer_state)
-                mx.save_safetensors(final_optimizer_checkpoint_name, optimizer_state)
-                if step_count:
-                    with open(receipt_name, 'w') as receipt_file:
-                        json.dump({
+                save_state(model, final_model_checkpoint_name, optimizer, final_optimizer_checkpoint_name, receipt_name, {
                             'step': step,
+                            'wandb_run_name': wandb_run.name if wandb_run else None,
                             'current_column': training_column,
+                            'total_tokens': total_tokens,
                             'run_command': run_command,
                             'training_config': training_config,
-                        }, receipt_file)
+                        })
         finally:
             validation_batch_queue.shutdown()
             training_batch_queue.shutdown()
-            #inference_manager.finish()
+            inference_manager.finish()
             # save_queue.shutdown()
 
     # Finish the wandb run successfully.
     if wandb_run:
         wandb_run.finish()
 
+def save_state(model: AilmV1, final_model_checkpoint_name: str, optimizer: mlx.optimizers.Optimizer, final_optimizer_checkpoint_name: str, receipt_name: str, receipt_state: typing.Dict[str, typing.Any]):
+    model.save_weights(final_model_checkpoint_name)
+    optimizer_state = tree_flatten(optimizer.state, destination={})
+    # Setting the destination kwarg forces the type we'd like, but the linter doesn't know this.
+    optimizer_state = typing.cast(dict[str, Tensor], optimizer_state)
+    mx.save_safetensors(final_optimizer_checkpoint_name, optimizer_state)
+    if receipt_state:
+        with open(receipt_name, 'w') as receipt_file:
+            json.dump(receipt_state, receipt_file)
 
 if __name__ == '__main__':
     import argparse

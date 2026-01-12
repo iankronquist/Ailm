@@ -6,6 +6,7 @@ import typing
 import mlx.core as mx
 import tiktoken
 from model import AilmV1, AilmV1Config
+import yaml
 
 # MARK: Sampling
 
@@ -37,7 +38,7 @@ def decode_and_print_worker(tokenizer: tiktoken.Encoding, work_queue: queue.Queu
     while True:
         try:
             batched_tokens = work_queue.get()
-            tokens_list  = batched_tokens.tolist()
+            tokens_list  = batched_tokens
             tokens_list = typing.cast(list[list[int]], tokens_list)
             decoded = tokenizer.decode_batch(tokens_list)
             print('\n----\n'.join(decoded))
@@ -110,7 +111,7 @@ class InferenceManager:
             todos = mx.concatenate([todos, chosen[:, None]], axis=-1)
         self.model.reset_key_value_cache(False)
         self.model.train(True)
-        self.decoder_queue.put(todos)
+        self.decoder_queue.put(todos.tolist())
 
 
 # MARK: Inference   
@@ -175,11 +176,12 @@ if __name__ == '__main__':
     argparser = argparse.ArgumentParser(description='Run inference with the model')
     argparser.add_argument('models', type=str, nargs='+', help='Safetensors or npz file with the model weights')
     argparser.add_argument('--model-arch', type=str, help='The architecture of the model', choices=supported_models)
+    argparser.add_argument('--config-file', type=str, help='The config file from which to get the architecture of the model', default=None)
     argparser.add_argument('--token-count', type=int, default=50, help='The number of tokens to generate. Does not include the prompt.')
     argparser.add_argument('--batch-count', type=int, default=4, help='The number of batches of tokens to generate in parallel.')
     argparser.add_argument('--tokenizer', type=str, default='gpt2', help='The tokenizer to use.')
     argparser.add_argument('--temperature', type=float, default=0.5, help='The temperature for sampling.')
-    argparser.add_argument('--top-k', type=int, default=4, help='The k cutoff value for sampling.')
+    argparser.add_argument('--top-k', type=int, default=10, help='The k cutoff value for sampling.')
     argparser.add_argument('--sample-strategy', type=str, default='topk', choices=SAMPLE_STRATEGIES.keys(), help='Sample strategy.')
     argparser.add_argument('--enable-kv-cache', type=str2bool, default=True, help='Enable the Key Value cache.')
     argparser.add_argument('--prompt', type=str, default='To be or not to be,', help='The prompt with which to start generation.')
@@ -196,7 +198,12 @@ if __name__ == '__main__':
         print('model_name', model_name)
         try:
             # Initialize the model and tokenizer.
-            config = AilmV1Config(no_rms_norm_weight=False)
+            if args.config_file:
+                with open(args.config_file) as config_file:
+                    config_file = yaml.safe_load(config_file)
+                config = AilmV1Config(**config_file['model_config'])
+            else:
+                config = AilmV1Config(no_rms_norm_weight=False)
             model = AilmV1(config)
             model.load_weights(model_name )
 
