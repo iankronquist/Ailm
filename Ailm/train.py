@@ -33,6 +33,7 @@ from model_utils import model_name_to_class_and_config
 from infer import InferenceManager, infer
 from model import AilmV1Config, AilmV1, dtype_name_to_mlx_dtype
 from fineweb_data_loader import FineWebDataLoader, AbstractDataLoader
+from streaming_fineweb_data_loader import StreamingFineWebDataLoader
 from q_and_a_data_loader import QaReasoningComboTextDataLoader
 
 # MARK: Utilities
@@ -386,12 +387,14 @@ def create_data_loader(data_loader_config: DataLoaderConfig, batch_config: Batch
 
     if data_loader_config.kind == 'fineweb':
         return FineWebDataLoader(batch_config.sequences_per_micro_batch, batch_config.sequence_length, data_loader_config.directory, tokenizer, start_column=start_column, shuffle=data_loader_config.shuffle)
+    if data_loader_config.kind == 'streaming_fineweb':
+        return StreamingFineWebDataLoader(batch_config.sequences_per_micro_batch, batch_config.sequence_length, data_loader_config.directory, tokenizer, start_column=start_column, shuffle=data_loader_config.shuffle)
     if data_loader_config.kind == 'synth_combo':
         allowed_special_tokens = None
         if tokenizer_config.extra_tokens:
             allowed_special_tokens = set(tokenizer_config.extra_tokens)
         return QaReasoningComboTextDataLoader(batch_config.sequences_per_micro_batch, batch_config.sequence_length, data_loader_config.directory, tokenizer, start_column=start_column, shuffle=data_loader_config.shuffle, allowed_special_tokens=allowed_special_tokens)
-    raise NotImplementedError(f"Unknown data loader kind {data_loader_config.kind}")
+    raise NotImplementedError(f"Unknown data loader kind {data_loader_config.kind}. Should be fineweb or synth_combo.")
 
 def create_model(training_config: dict, resume_weights: typing.Optional[str], grad_scaling_dtype: typing.Optional[mx.Dtype]) -> tuple[AilmV1, AilmV1, AilmV1Config]:
     '''Create the model from the training config'''
@@ -558,7 +561,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     - save_directory: The directory in which to save checkpoints, model weights, optimizer weights, and other detritus
     - no_save: Disables saving the model weights and wandb logging. Useful for kicking off a quick test run. 
     '''
-    training_start = time.strftime("%Y%m%d-%H%M")
+    training_start_timestamp = time.strftime("%Y%m%d-%H%M")
 
     # HACK: It seems kind of janky but if I send SIGUSR1 to the training process I should be able to break into it with PDB and edit things on the fly.
     if not no_save:
@@ -649,7 +652,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     validation_batch_queue = create_encoder_worker(tokenizing_config, validation_loader, "Validation encoder")
 
     # Create the directory to hold all of our save files.
-    run_name = f'run_{training_start}'
+    run_name = f'run_{training_start_timestamp}'
     run_dir_path = os.path.join(save_directory, run_name)
     final_model_checkpoint_name = os.path.join(run_dir_path, 'final_model.npz')
     final_optimizer_checkpoint_name = os.path.join(run_dir_path, 'final_opt.safetensors')
@@ -679,7 +682,7 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
     pprint(training_config)
 
     print(f'Training process pid is {os.getpid()}')
-    print('Training started at', training_start)
+    print('Training started at', training_start_timestamp)
     print("The model has", format_count(parameter_count), "parameters")
     print('tokens to process', format_count(tokens_to_process))
     print('step count', step_count)
@@ -897,7 +900,9 @@ def train_model(training_config: dict[str, typing.Any], save_directory: str, no_
                     steps_remaining = step_count - step
                     eta_seconds = mean_time_per_step * steps_remaining
 
-                    print(*log_message.values(), format_time(eta_seconds))
+                    log_text = ' '.join([f'{key.replace("train/", "")}: {value}' for key, value in log_message.items()]) + ' ' + format_time(eta_seconds)
+                    #print(*log_message.values(), format_time(eta_seconds))
+                    print(log_text)
                     # The stopwatch restarts from the moment we last stopped it, that is the beginning of the logging step.
                     stopwatch_start = stopwatch_stop
                 last_update_step = step
