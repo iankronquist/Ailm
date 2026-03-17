@@ -1,0 +1,119 @@
+
+model_name: AilmV1
+
+use_wandb: True
+
+
+rng_seed: 42
+# If you delete this the trainer will calculate the chinchilla optimal number of tokens.
+# token_budget: 4.0e+6
+# Easily override these for testing.
+# step_count: 2000
+# gradient_accumulation_steps: 12
+
+# Set a memory limit of 30gib. MacOS will hang if the compute graph balloons above the size of RAM.
+memory_limit: 32212254720
+
+# The number of batches to run validation over.
+validation_batches: 50
+
+# Override AilmV1Config.
+# This config is more like baguettotron. It's leaner and deeper.
+# Unlike baguettotron it uses attention sinks.
+# vocab_size: 50304
+# layer_count: 30
+# head_count: 9
+# hidden_size: 576
+# key_value_head_count: 3
+# mlp_size: 1536
+# use_kv_cache: False
+# use_attention_sinks: True
+model_config:
+  dtype: bf16
+  use_kv_cache: false
+  vocab_size: 50304
+  layer_count: 20
+  head_count: 12
+  hidden_size: 768
+  mlp_size: 3072
+  key_value_head_count: 4
+  use_attention_sinks: true
+  no_rms_norm_weight: true
+
+
+
+# When training in f16 we need to scale gradients into a representable range.
+#gradient_scaling_factor: 128
+#gradient_dtype: bf16
+
+# To determine a solid learning rate schedule I did a survey of various model papers and consulted the
+# Huggingface Smol Training Playbook
+# Playbook: https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook#scaling-laws-for-hyperparameters
+# Survey: https://docs.google.com/spreadsheets/d/1mTQkUpaVkdVNfDkuHVeTPam0ERx-XIXm_8Dy2JUf1qk/edit?usp=sharing
+learning_rate_schedule:
+  kind: trapezoid
+  # Used by nanochat
+  learning_rate_max: 0.02
+  learning_rate_min: 0.002
+  warmup_percent: 5
+  rampdown_percent: 5
+
+optimizer:
+  name: muon
+  # nanochat uses 0.0
+  weight_decay: 0.0
+  muon_momentum: 0.95
+  # Widely used in the survey and recommended by Karpathy and Smollm
+  gradient_norm_clipping: 1.0
+
+# We train off of a subset of fineweb edu 20B.
+training_data_loader:
+  kind: synth_combo
+  directory: datasets/pleias_synth/
+  shuffle: true
+
+# I took the last, smaller parquet file from fineweb edu 20B and called it a validation set.
+validation_data_loader:
+  kind: synth_combo
+  directory: datasets/pleias_synth/validate/
+  shuffle: true
+
+batching:
+  # Modern LLMs use sequence lengths of around 2048-4096.
+  # However, to train on my laptop it's important to keep the memory requirements small, and increasing this will cause quadratic growth of the attention matrix.
+  sequence_length: 1024
+  # 0.5e6 rounded up to be a multiple of sequences_per_micro_batch * sequence_length
+  tokens_per_batch: 503808
+  # Since I'm compute bound, on my M1 Max both 4 and 8 get similar performance, but 4 uses less RAM.
+  # 4 also leads to less variance in tokens per second.
+  sequences_per_micro_batch: 4
+
+
+# Intervals at which to perform various expensive tasks.
+# These are expressed in terms of full batch steps, not microbatch steps.
+intervals:
+  save_interval: 100
+  validation_interval: 100
+  log_interval: 1
+  inference_interval: 100
+
+
+tokenizing:
+  tokenizer_name: gpt2
+  tokenizer_queue_length: 8
+  encoder_stall_seconds: 300
+  trainer_stall_seconds: 300
+  extra_tokens:
+    - "<user>"
+    - "</user>"
+    - "<think>"
+    - "</think>"
+    - "<agent>"
+    - "</agent>"
+
+inference:
+    prompt: "To be or not to be,"
+    max_tokens_to_generate: 10
+    max_batches: 4
+    k: 4
+    temperature: 0.5
